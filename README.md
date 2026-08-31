@@ -19,23 +19,7 @@ This project is an improved version of `impacket/examples/smbclient.py` focused 
 
 ---
 
-## Requirements
 
-- Python 3.8+
-- impacket
-
-Install dependencies with pip (preferably in a virtualenv):
-
-```bash
-python3 -m venv venv
-source venv/bin/activate
-pip install --upgrade pip
-pip install impacket
-```
-
-Note: Depending on your environment you may need additional system libraries for Impacket or to run with appropriate privileges.
-
----
 
 ## Quick start — run the client
 
