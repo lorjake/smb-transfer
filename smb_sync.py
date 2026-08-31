@@ -10,7 +10,7 @@ import shlex
 import csv
 import json
 import re
-from datetime import datetime
+from datetime import datetime, timezone
 from queue import Queue
 from threading import Thread
 from impacket.examples import logger
@@ -18,7 +18,16 @@ from impacket.examples.utils import parse_target
 from impacket.smbconnection import SMBConnection
 from impacket.smb3structs import FILE_READ_DATA
 
-CHUNK_SIZE = 64 * 1024
+# Tunable defaults
+CHUNK_SIZE = 1024 * 1024  # 1 MB default chunk size for reads
+MULTIPART_THRESHOLD = 32 * 1024 * 1024  # 32 MB - files larger than this may use multipart
+MAX_PARTS_DEFAULT = 8
+
+# Optional dependencies
+try:
+    from tqdm import tqdm
+except Exception:
+    tqdm = None
 
 
 def parse_index_set(s: str):
@@ -79,54 +88,81 @@ class SMBManager:
 
 
 class ResilientDownloader:
-    """Multi-threaded downloader with directory scanning, resume capabilities and exporting."""
-    def __init__(self, smb_mgr, share, num_threads=4):
+    """Multi-threaded downloader with directory scanning, resume capabilities, multipart downloads and exporting."""
+    def __init__(self, smb_mgr, share, num_threads=4, progress=True, chunk_size=CHUNK_SIZE, multipart_threshold=MULTIPART_THRESHOLD, max_parts=MAX_PARTS_DEFAULT):
         self.smb_mgr = smb_mgr
         self.share = share
         self.num_threads = num_threads
         self.task_queue = Queue()
+        self.progress = progress and (tqdm is not None)
+        self.chunk_size = chunk_size
+        self.multipart_threshold = multipart_threshold
+        self.max_parts = max_parts
 
     def _get_item_mtime(self, item):
-        # Try common attributes used by impacket FileEntry objects; return datetime or None
-        for attr in ('get_mtime', 'get_last_write_time', 'get_mtime_epoch'):
+        # Improved detection: try several accessors and interpret values
+        # Return aware datetime in UTC when possible
+        candidates = [
+            'get_mtime', 'get_last_write_time', 'get_mtime_epoch',
+            'get_last_write_time_epoch', 'get_create_time', 'get_time', 'get_modify_time'
+        ]
+        for attr in candidates:
             fn = getattr(item, attr, None)
             if callable(fn):
                 try:
                     val = fn()
-                    # If it's an int/float epoch
-                    if isinstance(val, (int, float)):
-                        try:
-                            return datetime.fromtimestamp(val)
-                        except Exception:
-                            return None
-                    # If it's already a datetime
-                    if isinstance(val, datetime):
-                        return val
                 except Exception:
                     continue
-        # Some item objects expose 'get_time' or 'get_create_time' - attempt .get_time
-        try:
-            val = getattr(item, 'get_time', None)
-            if callable(val):
-                v = val()
-                if isinstance(v, (int, float)):
-                    return datetime.fromtimestamp(v)
-        except Exception:
-            pass
+                if val is None:
+                    continue
+                # If impacket returns Windows FILETIME (100-ns since 1601) it's a large int > 1e12
+                if isinstance(val, int) or isinstance(val, float):
+                    try:
+                        v = int(val)
+                    except Exception:
+                        continue
+                    # Heuristic: FILETIME values are > 10^16 sometimes; epoch seconds ~1e9
+                    if v > 11644473600 * 10000000:  # very large: FILETIME (100-ns ticks)
+                        try:
+                            seconds = v / 10000000 - 11644473600
+                            return datetime.fromtimestamp(seconds, tz=timezone.utc)
+                        except Exception:
+                            continue
+                    # If value looks like milliseconds
+                    if v > 1e12:
+                        try:
+                            return datetime.fromtimestamp(v / 1000, tz=timezone.utc)
+                        except Exception:
+                            continue
+                    # Epoch seconds
+                    if v > 1000000000:
+                        try:
+                            return datetime.fromtimestamp(v, tz=timezone.utc)
+                        except Exception:
+                            continue
+                if isinstance(val, datetime):
+                    # Make timezone-aware (assume UTC if naive)
+                    if val.tzinfo is None:
+                        return val.replace(tzinfo=timezone.utc)
+                    return val.astimezone(timezone.utc)
+        # Fallback: sometimes item has 'timestamp' attr or 'st_mtime'
+        for attr in ('timestamp', 'st_mtime'):
+            v = getattr(item, attr, None)
+            if isinstance(v, (int, float)):
+                try:
+                    return datetime.fromtimestamp(v, tz=timezone.utc)
+                except Exception:
+                    continue
         return None
 
-    def scan_files(self, smb, remote_dir):
-        """Recursively scans a remote SMB directory and returns list of dicts with path/size/mtime.
-        remote_dir: path relative to share (use backslashes). Empty string means root of share.
-        Returns: [{'path': str, 'size': int, 'mtime': datetime|None}, ...]
-        """
-        results = []
+    # Streaming scanner: yields matches instead of building a list
+    def scan_files_iter(self, smb, remote_dir):
         search_path = f"{remote_dir}\\*" if remote_dir else "*"
         try:
             items = smb.listPath(self.share, search_path)
         except Exception as e:
             logging.error(f"Failed to list directory '{remote_dir}': {e}")
-            return results
+            return
 
         for item in items:
             name = item.get_longname()
@@ -136,28 +172,30 @@ class ResilientDownloader:
             r_subpath = f"{remote_dir}\\{name}" if remote_dir else name
 
             if item.is_directory():
-                results.extend(self.scan_files(smb, r_subpath))
+                # Recurse generator
+                yield from self.scan_files_iter(smb, r_subpath)
             else:
                 try:
                     size = item.get_filesize()
                 except Exception:
                     size = 0
                 mtime = self._get_item_mtime(item)
-                results.append({'path': r_subpath, 'size': size, 'mtime': mtime})
-        return results
+                yield {'path': r_subpath, 'size': size, 'mtime': mtime}
+
+    def scan_files(self, smb, remote_dir):
+        # Backwards-compatible: collect into list
+        return list(self.scan_files_iter(smb, remote_dir))
 
     def discover_directory(self, smb, remote_dir, local_dir):
         """Queue all files from a remote directory recursively (keeps compatibility with older code)."""
         os.makedirs(local_dir, exist_ok=True)
-        files = self.scan_files(smb, remote_dir)
-        for f in files:
+        for f in self.scan_files(smb, remote_dir):
             remote_path = f['path']
             size = f['size']
             local_path = os.path.join(local_dir, *remote_path.split('\\'))
             self.task_queue.put((remote_path, local_path, size))
 
     def discover_pattern(self, smb, current_remote_path, local_dir, pattern):
-        """Discovers items matching a specific wildcard or file/folder name using SMB server globbing."""
         if current_remote_path:
             search_path = f"{current_remote_path}\\{pattern}"
         else:
@@ -220,7 +258,7 @@ class ResilientDownloader:
 
         logging.info("Transfer completed.")
 
-    def start_sync_from_list(self, file_list, local_base_dir):
+    def start_sync_from_list(self, file_list, local_base_dir, show_progress=True):
         """Start downloads from an explicit list of remote files: file_list is [{'path':..., 'size':..., 'mtime':...}, ...].
         local_base_dir is the local directory where files will be saved preserving remote path structure.
         """
@@ -253,8 +291,112 @@ class ResilientDownloader:
 
         logging.info("Transfer completed.")
 
+    def _multipart_download(self, remote_file, local_file, expected_size):
+        """Download a single file by splitting into parts and downloading parts in parallel.
+        Writes to temporary part files and combines them on success.
+        """
+        part_count = min(self.max_parts, max(1, int(expected_size / (self.chunk_size * 4))))
+        part_count = max(1, part_count)
+        # don't exceed sensible upper bound
+        part_count = min(part_count, self.max_parts)
+        ranges = []
+        part_size = expected_size // part_count
+        for i in range(part_count):
+            start = i * part_size
+            end = (start + part_size - 1) if i < part_count - 1 else expected_size - 1
+            ranges.append((i, start, end))
+
+        tmp_dir = os.path.dirname(local_file)
+        part_files = [os.path.join(tmp_dir, f".{os.path.basename(local_file)}.part{i}") for i in range(part_count)]
+
+        # Worker for one part
+        def part_worker(idx, start, end, out_path):
+            smb = None
+            offset = start
+            mode = 'wb'
+            try:
+                with open(out_path, mode) as out_f:
+                    while offset <= end:
+                        try:
+                            if smb is None:
+                                smb = self.smb_mgr.create_connection()
+                            tid = smb.connectTree(self.share)
+                            fid = smb.openFile(tid, remote_file, desiredAccess=FILE_READ_DATA)
+                            to_read = min(self.chunk_size, end - offset + 1)
+                            chunk = smb.readFile(tid, fid, offset, to_read)
+                            if not chunk:
+                                break
+                            out_f.write(chunk)
+                            offset += len(chunk)
+                            smb.closeFile(tid, fid)
+                            smb.disconnectTree(tid)
+                        except Exception as e:
+                            logging.warning(f"[PART {idx} INTERRUPTED] {remote_file} at {offset}/{end}. Error: {e}")
+                            smb = None
+                            time.sleep(1)
+                    return True
+            except Exception as ex:
+                logging.error(f"[PART {idx} ERROR] {ex}")
+                return False
+            finally:
+                try:
+                    if smb:
+                        smb.logoff()
+                except Exception:
+                    pass
+
+        threads = []
+        results = [False] * part_count
+        for idx, start, end in ranges:
+            out_path = part_files[idx]
+            t = Thread(target=lambda i, s, e, p, res_idx: res.__setitem__(res_idx, part_worker(i, s, e, p)), args=(idx, start, end, out_path, idx))
+            # Python closure trick: use results and set inside lambda
+            # But lambda with side effect; simpler to start a wrapper thread
+            def starter(i, s, e, p, ridx):
+                ok = part_worker(i, s, e, p)
+                results[ridx] = ok
+            th = Thread(target=starter, args=(idx, start, end, out_path, idx))
+            th.daemon = True
+            th.start()
+            threads.append(th)
+
+        for th in threads:
+            th.join()
+
+        if not all(results):
+            logging.error(f"Multipart download failed for {remote_file}")
+            # cleanup part files
+            for pf in part_files:
+                try:
+                    if os.path.exists(pf):
+                        os.remove(pf)
+                except Exception:
+                    pass
+            return False
+
+        # Combine parts
+        try:
+            with open(local_file, 'wb') as outf:
+                for pf in part_files:
+                    with open(pf, 'rb') as inf:
+                        while True:
+                            chunk = inf.read(1024 * 1024)
+                            if not chunk:
+                                break
+                            outf.write(chunk)
+            # remove parts
+            for pf in part_files:
+                try:
+                    os.remove(pf)
+                except Exception:
+                    pass
+            return True
+        except Exception as ex:
+            logging.error(f"Failed to assemble parts for {remote_file}: {ex}")
+            return False
+
     def download_worker(self):
-        """Worker thread executing file downloads with byte-offset resuming."""
+        """Worker thread executing file downloads with byte-offset resuming and optional multipart."""
         smb = None
         while True:
             task = self.task_queue.get()
@@ -270,6 +412,26 @@ class ResilientDownloader:
             remote_file, local_file, expected_size = task
             os.makedirs(os.path.dirname(local_file), exist_ok=True)
 
+            # Decide multipart
+            use_multipart = expected_size >= self.multipart_threshold and self.max_parts > 1
+
+            if use_multipart:
+                # If local file exists and matches size, skip
+                if os.path.exists(local_file) and os.path.getsize(local_file) == expected_size:
+                    logging.info(f"[SKIP] {remote_file} (Already complete)")
+                    self.task_queue.task_done()
+                    continue
+                logging.info(f"[MULTIPART] {remote_file} ({expected_size} bytes) using up to {self.max_parts} parts")
+                ok = self._multipart_download(remote_file, local_file, expected_size)
+                if ok:
+                    logging.info(f"[COMPLETE] {remote_file}")
+                else:
+                    logging.warning(f"[FAILED] multipart for {remote_file}, falling back to single-threaded")
+                    # fallback to single-stream
+                self.task_queue.task_done()
+                continue
+
+            # Single-stream resume logic
             start_offset = 0
             if os.path.exists(local_file):
                 start_offset = os.path.getsize(local_file)
@@ -287,6 +449,15 @@ class ResilientDownloader:
                 logging.info(f"[START] {remote_file} ({expected_size} bytes)")
 
             offset = start_offset
+
+            # Progress bar for this file
+            pbar = None
+            if self.progress:
+                try:
+                    pbar = tqdm(total=expected_size, unit='B', unit_scale=True, desc=os.path.basename(remote_file), initial=offset)
+                except Exception:
+                    pbar = None
+
             while offset < expected_size:
                 try:
                     if smb is None:
@@ -297,21 +468,32 @@ class ResilientDownloader:
 
                     with open(local_file, mode) as lf:
                         while offset < expected_size:
-                            bytes_to_read = min(CHUNK_SIZE, expected_size - offset)
+                            bytes_to_read = min(self.chunk_size, expected_size - offset)
                             chunk = smb.readFile(tid, fid, offset, bytes_to_read)
                             if not chunk:
                                 break
                             lf.write(chunk)
                             offset += len(chunk)
+                            if pbar:
+                                pbar.update(len(chunk))
 
-                    smb.closeFile(tid, fid)
-                    smb.disconnectTree(tid)
+                    try:
+                        smb.closeFile(tid, fid)
+                        smb.disconnectTree(tid)
+                    except Exception:
+                        pass
 
                 except Exception as e:
                     logging.warning(f"[INTERRUPTED] {remote_file} at {offset}/{expected_size}. Error: {e}")
                     smb = None
                     mode = 'ab'
                     time.sleep(3)
+
+            if pbar:
+                try:
+                    pbar.close()
+                except Exception:
+                    pass
 
             if offset == expected_size:
                 logging.info(f"[COMPLETE] {remote_file}")
@@ -428,10 +610,12 @@ class InteractiveSMBShell(cmd.Cmd):
           ext:csv list, pattern:PAT, path:REMOTE_PATH
           size:min-max (bytes or k/m/g suffix), date:YYYY-MM-DD..YYYY-MM-DD
           --export filename.csv/json and --format json/csv
+          --stream to print results as discovered
+          --export-columns=col1,col2 or --template="{path},{size}"
         Returns: (filters, options) where filters is dict and options holds export/format
         """
         filters = {}
-        options = {'export': None, 'format': 'csv'}
+        options = {'export': None, 'format': 'csv', 'stream': False, 'export_columns': None, 'template': None, 'no_progress': False, 'chunk_size': None, 'multipart_threshold': None, 'max_parts': None}
         if not argline:
             return filters, options
         parts = shlex.split(argline)
@@ -441,6 +625,36 @@ class InteractiveSMBShell(cmd.Cmd):
                 continue
             if p == '--json' or p == '--format=json':
                 options['format'] = 'json'
+                continue
+            if p == '--stream':
+                options['stream'] = True
+                continue
+            if p.startswith('--export-columns='):
+                options['export_columns'] = [c.strip() for c in p.split('=', 1)[1].split(',') if c.strip()]
+                continue
+            if p.startswith('--template='):
+                options['template'] = p.split('=', 1)[1]
+                continue
+            if p == '--no-progress':
+                options['no_progress'] = True
+                continue
+            if p.startswith('--chunk-size='):
+                try:
+                    options['chunk_size'] = int(p.split('=', 1)[1])
+                except Exception:
+                    options['chunk_size'] = None
+                continue
+            if p.startswith('--multipart-threshold='):
+                try:
+                    options['multipart_threshold'] = int(p.split('=', 1)[1])
+                except Exception:
+                    options['multipart_threshold'] = None
+                continue
+            if p.startswith('--max-parts='):
+                try:
+                    options['max_parts'] = int(p.split('=', 1)[1])
+                except Exception:
+                    options['max_parts'] = None
                 continue
             if p.startswith('ext:'):
                 exts = [e.strip().lstrip('.') .lower() for e in p[len('ext:'):].split(',') if e.strip()]
@@ -454,7 +668,6 @@ class InteractiveSMBShell(cmd.Cmd):
                 continue
             if p.startswith('size:'):
                 rng = p[len('size:'):]
-                # format min-max where each can be empty
                 lo, hi = None, None
                 if '-' in rng:
                     a, b = rng.split('-', 1)
@@ -500,26 +713,22 @@ class InteractiveSMBShell(cmd.Cmd):
                         return None
                     for fmt in ('%Y-%m-%d', '%Y/%m/%d'):
                         try:
-                            return datetime.strptime(t, fmt)
+                            return datetime.strptime(t, fmt).replace(tzinfo=timezone.utc)
                         except Exception:
                             continue
                     return None
                 filters['date_from'] = parse_date_token(lo)
                 filters['date_to'] = parse_date_token(hi)
                 continue
-            # shorthand wildcard or extension
             if '*' in p or '?' in p:
                 filters['pattern'] = p
                 continue
-            # extension shorthand like pdf or .pdf
             if p.startswith('.'):
                 filters['ext'] = [p.lstrip('.').lower()]
                 continue
             if re.match(r'^[a-zA-Z0-9]+$', p) and '.' not in p:
-                # treat as extension shorthand
                 filters['ext'] = [p.lower()]
                 continue
-            # unknown token - ignore or maybe treat as pattern
         return filters, options
 
     def _apply_filters(self, entries, filters):
@@ -598,15 +807,64 @@ class InteractiveSMBShell(cmd.Cmd):
           lsf date:2023-01-01..2023-12-31 -> date range (YYYY-MM-DD)
           lsf --export=out.csv    -> export results (CSV by default)
           lsf --json              -> export JSON
+          lsf --stream            -> stream results (low-memory)
+          lsf --export-columns=path,size,mtime  -> customize CSV/JSON columns
+          lsf --template="{path},{size}"         -> custom format per row
         """
         if not self.current_share:
             print("[-] Error: Select a share first using 'use <SHARE_NAME>'")
             return
 
         filters, options = self._parse_lsf_args(line)
-        downloader = ResilientDownloader(self.smb_mgr, self.current_share, self.threads)
+        downloader = ResilientDownloader(self.smb_mgr, self.current_share, self.threads, progress=not options.get('no_progress', False), chunk_size=options.get('chunk_size') or CHUNK_SIZE, multipart_threshold=options.get('multipart_threshold') or MULTIPART_THRESHOLD, max_parts=options.get('max_parts') or MAX_PARTS_DEFAULT)
 
         print("[+] Scanning remote files (this may take a while)...")
+
+        # Streaming mode: avoid storing all in memory
+        if options.get('stream'):
+            found = 0
+            export_path = options.get('export')
+            out_f = None
+            writer = None
+            if export_path and options.get('format') != 'json':
+                out_f = open(export_path, 'w', newline='', encoding='utf-8')
+                writer = csv.writer(out_f)
+                cols = options.get('export_columns') or ['path', 'size', 'mtime']
+                writer.writerow(cols)
+            if export_path and options.get('format') == 'json':
+                j_out = open(export_path, 'w', encoding='utf-8')
+                j_out.write('[')
+                first = True
+            try:
+                for e in downloader.scan_files_iter(self.smb, self.current_path):
+                    if self._apply_filters([e], filters):
+                        found += 1
+                        mtime_str = e['mtime'].isoformat() if e.get('mtime') else ''
+                        if options.get('template'):
+                            try:
+                                print(options['template'].format(path=e['path'], size=e['size'], mtime=mtime_str))
+                            except Exception:
+                                print(f"{e['path']},{e['size']},{mtime_str}")
+                        else:
+                            print(f"{e['path']}  -  {e['size']} bytes  -  {mtime_str}")
+                        if writer:
+                            row = [e.get(c, '') if c != 'mtime' else (e['mtime'].isoformat() if e.get('mtime') else '') for c in (options.get('export_columns') or ['path', 'size', 'mtime'])]
+                            writer.writerow(row)
+                        if export_path and options.get('format') == 'json':
+                            if not first:
+                                j_out.write(',\n')
+                            j_out.write(json.dumps(e, default=str))
+                            first = False
+                print(f"[+] Streamed {found} matching files")
+            finally:
+                if out_f:
+                    out_f.close()
+                if export_path and options.get('format') == 'json':
+                    j_out.write(']')
+                    j_out.close()
+            return
+
+        # Non-streaming: collect full list
         all_files = downloader.scan_files(self.smb, self.current_path)
         self.last_scan = all_files
 
@@ -621,20 +879,33 @@ class InteractiveSMBShell(cmd.Cmd):
             print(f"{idx:4d}. {e['path']}  -  {e['size']} bytes  -  {mtime_str}")
         print("-" * 120 + "\n")
 
-        # export if requested
+        # export if requested with custom columns or template
         if options.get('export'):
             outpath = options['export']
             fmt = options.get('format', 'csv')
             try:
                 if fmt == 'json':
+                    # JSON export: dump filtered objects (mtime as ISO)
+                    dumpable = []
+                    for e in filtered:
+                        ee = dict(e)
+                        ee['mtime'] = ee['mtime'].isoformat() if ee.get('mtime') else None
+                        dumpable.append(ee)
                     with open(outpath, 'w', encoding='utf-8') as jf:
-                        json.dump(filtered, jf, default=str, indent=2)
+                        json.dump(dumpable, jf, indent=2)
                 else:
+                    cols = options.get('export_columns') or ['path', 'size', 'mtime']
                     with open(outpath, 'w', newline='', encoding='utf-8') as cf:
                         writer = csv.writer(cf)
-                        writer.writerow(['path', 'size', 'mtime'])
+                        writer.writerow(cols)
                         for e in filtered:
-                            writer.writerow([e['path'], e['size'], e['mtime'].isoformat() if e.get('mtime') else ''])
+                            row = []
+                            for c in cols:
+                                if c == 'mtime':
+                                    row.append(e['mtime'].isoformat() if e.get('mtime') else '')
+                                else:
+                                    row.append(e.get(c, ''))
+                            writer.writerow(row)
                 print(f"[+] Exported {len(filtered)} results to {outpath}")
             except Exception as ex:
                 print(f"[-] Failed to export results: {ex}")
@@ -709,7 +980,6 @@ class InteractiveSMBShell(cmd.Cmd):
                     pass
                 i += 2
                 continue
-            # leftover token treat as index expression or thread count numeric
             if re.match(r'^\d+$', p) and len(parts) == 1:
                 try:
                     nthreads = int(p)
@@ -717,7 +987,6 @@ class InteractiveSMBShell(cmd.Cmd):
                     pass
                 i += 1
                 continue
-            # otherwise treat as indices
             index_expr = p
             i += 1
 
@@ -741,7 +1010,7 @@ class InteractiveSMBShell(cmd.Cmd):
                 print(f"  {e['path']}  -  {e['size']} bytes")
             return
 
-        downloader = ResilientDownloader(self.smb_mgr, self.current_share, nthreads)
+        downloader = ResilientDownloader(self.smb_mgr, self.current_share, nthreads, progress=True, chunk_size=CHUNK_SIZE, multipart_threshold=MULTIPART_THRESHOLD, max_parts=MAX_PARTS_DEFAULT)
         downloader.start_sync_from_list(to_transfer, self.local_dir)
 
     def do_exit(self, line):
