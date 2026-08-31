@@ -33,16 +33,15 @@ Examples:
 
 - Connect with username and prompt for password:
   ```bash
-  python3 smb_sync.py 'DOMAIN/jdoe@fileserver'
+  python3 smb_sync.py 'admin@192.168.1.10'
   # Password prompt will appear
   ```
 
 - Connect with inline password (be careful — this leaves credentials in your shell history):
   ```bash
-  python3 smb_sync.py 'jdoe:SuperSecret@192.168.1.10' -threads 8
+  python3 smb_sync.py 'admin:password@192.168.1.10' -threads 8
   ```
 
-- Use NTLM hashes instead of a password: `-hashes LMHASH:NTHASH`.
 
 After starting, you'll land in an interactive SMB> prompt.
 
