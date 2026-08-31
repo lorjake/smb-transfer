@@ -6,6 +6,11 @@ import time
 import logging
 import argparse
 import fnmatch
+import shlex
+import csv
+import json
+import re
+from datetime import datetime
 from queue import Queue
 from threading import Thread
 from impacket.examples import logger
@@ -14,6 +19,37 @@ from impacket.smbconnection import SMBConnection
 from impacket.smb3structs import FILE_READ_DATA
 
 CHUNK_SIZE = 64 * 1024
+
+
+def parse_index_set(s: str):
+    """Parse index expressions like "1,3-5,8" into a sorted list of unique 0-based indices."""
+    if not s:
+        return []
+    parts = re.split(r'[ ,]+', s.strip())
+    idxs = set()
+    for p in parts:
+        if not p:
+            continue
+        if '-' in p:
+            a, b = p.split('-', 1)
+            try:
+                a_i = int(a)
+                b_i = int(b)
+            except ValueError:
+                continue
+            if a_i <= 0 or b_i <= 0:
+                continue
+            for i in range(a_i, b_i + 1):
+                idxs.add(i - 1)
+        else:
+            try:
+                v = int(p)
+            except ValueError:
+                continue
+            if v <= 0:
+                continue
+            idxs.add(v - 1)
+    return sorted(idxs)
 
 
 class SMBManager:
@@ -43,16 +79,46 @@ class SMBManager:
 
 
 class ResilientDownloader:
-    """Multi-threaded downloader with directory scanning and resume capabilities."""
+    """Multi-threaded downloader with directory scanning, resume capabilities and exporting."""
     def __init__(self, smb_mgr, share, num_threads=4):
         self.smb_mgr = smb_mgr
         self.share = share
         self.num_threads = num_threads
         self.task_queue = Queue()
 
+    def _get_item_mtime(self, item):
+        # Try common attributes used by impacket FileEntry objects; return datetime or None
+        for attr in ('get_mtime', 'get_last_write_time', 'get_mtime_epoch'):
+            fn = getattr(item, attr, None)
+            if callable(fn):
+                try:
+                    val = fn()
+                    # If it's an int/float epoch
+                    if isinstance(val, (int, float)):
+                        try:
+                            return datetime.fromtimestamp(val)
+                        except Exception:
+                            return None
+                    # If it's already a datetime
+                    if isinstance(val, datetime):
+                        return val
+                except Exception:
+                    continue
+        # Some item objects expose 'get_time' or 'get_create_time' - attempt .get_time
+        try:
+            val = getattr(item, 'get_time', None)
+            if callable(val):
+                v = val()
+                if isinstance(v, (int, float)):
+                    return datetime.fromtimestamp(v)
+        except Exception:
+            pass
+        return None
+
     def scan_files(self, smb, remote_dir):
-        """Recursively scans a remote SMB directory and returns list of (remote_path, filesize).
+        """Recursively scans a remote SMB directory and returns list of dicts with path/size/mtime.
         remote_dir: path relative to share (use backslashes). Empty string means root of share.
+        Returns: [{'path': str, 'size': int, 'mtime': datetime|None}, ...]
         """
         results = []
         search_path = f"{remote_dir}\\*" if remote_dir else "*"
@@ -72,14 +138,21 @@ class ResilientDownloader:
             if item.is_directory():
                 results.extend(self.scan_files(smb, r_subpath))
             else:
-                results.append((r_subpath, item.get_filesize()))
+                try:
+                    size = item.get_filesize()
+                except Exception:
+                    size = 0
+                mtime = self._get_item_mtime(item)
+                results.append({'path': r_subpath, 'size': size, 'mtime': mtime})
         return results
 
     def discover_directory(self, smb, remote_dir, local_dir):
         """Queue all files from a remote directory recursively (keeps compatibility with older code)."""
         os.makedirs(local_dir, exist_ok=True)
         files = self.scan_files(smb, remote_dir)
-        for remote_path, size in files:
+        for f in files:
+            remote_path = f['path']
+            size = f['size']
             local_path = os.path.join(local_dir, *remote_path.split('\\'))
             self.task_queue.put((remote_path, local_path, size))
 
@@ -107,7 +180,11 @@ class ResilientDownloader:
             if item.is_directory():
                 self.discover_directory(smb, r_subpath, l_subpath)
             else:
-                self.task_queue.put((r_subpath, l_subpath, item.get_filesize()))
+                try:
+                    size = item.get_filesize()
+                except Exception:
+                    size = 0
+                self.task_queue.put((r_subpath, l_subpath, size))
 
     def start_sync(self, current_remote_path, local_dir, pattern="*"):
         main_smb = self.smb_mgr.create_connection()
@@ -144,10 +221,12 @@ class ResilientDownloader:
         logging.info("Transfer completed.")
 
     def start_sync_from_list(self, file_list, local_base_dir):
-        """Start downloads from an explicit list of remote files: file_list is [(remote_path, size), ...].
+        """Start downloads from an explicit list of remote files: file_list is [{'path':..., 'size':..., 'mtime':...}, ...].
         local_base_dir is the local directory where files will be saved preserving remote path structure.
         """
-        for remote_path, size in file_list:
+        for f in file_list:
+            remote_path = f['path']
+            size = f.get('size', 0)
             local_path = os.path.join(local_base_dir, *remote_path.split('\\'))
             os.makedirs(os.path.dirname(local_path), exist_ok=True)
             self.task_queue.put((remote_path, local_path, size))
@@ -252,7 +331,7 @@ class InteractiveSMBShell(cmd.Cmd):
         self.current_share = None
         self.current_path = ""
         self.local_dir = os.getcwd()
-        self.last_scan = []    # full list of scanned files [(remote_path, size), ...]
+        self.last_scan = []    # full list of scanned dicts [{'path','size','mtime'}]
         self.last_filtered = []
         print("[+] Authenticated! Type 'help' or 'shares' to list available shares.\n")
 
@@ -343,6 +422,153 @@ class InteractiveSMBShell(cmd.Cmd):
         self.local_dir = os.path.abspath(path)
         print(f"[+] Local download path set to: {self.local_dir}")
 
+    def _parse_lsf_args(self, argline):
+        """Parse lsf argument line and return filters dict and options.
+        Supports:
+          ext:csv list, pattern:PAT, path:REMOTE_PATH
+          size:min-max (bytes or k/m/g suffix), date:YYYY-MM-DD..YYYY-MM-DD
+          --export filename.csv/json and --format json/csv
+        Returns: (filters, options) where filters is dict and options holds export/format
+        """
+        filters = {}
+        options = {'export': None, 'format': 'csv'}
+        if not argline:
+            return filters, options
+        parts = shlex.split(argline)
+        for p in parts:
+            if p.startswith('--export='):
+                options['export'] = p.split('=', 1)[1]
+                continue
+            if p == '--json' or p == '--format=json':
+                options['format'] = 'json'
+                continue
+            if p.startswith('ext:'):
+                exts = [e.strip().lstrip('.') .lower() for e in p[len('ext:'):].split(',') if e.strip()]
+                filters['ext'] = exts
+                continue
+            if p.startswith('pattern:'):
+                filters['pattern'] = p[len('pattern:'):]
+                continue
+            if p.startswith('path:'):
+                filters['path'] = p[len('path:'):].strip().replace('/', '\\')
+                continue
+            if p.startswith('size:'):
+                rng = p[len('size:'):]
+                # format min-max where each can be empty
+                lo, hi = None, None
+                if '-' in rng:
+                    a, b = rng.split('-', 1)
+                    lo = a.strip() or None
+                    hi = b.strip() or None
+                else:
+                    lo = rng
+                def parse_size_token(t):
+                    if t is None:
+                        return None
+                    t = t.strip().lower()
+                    m = re.match(r'^(\d+)([kmg])?$', t)
+                    if not m:
+                        try:
+                            return int(t)
+                        except Exception:
+                            return None
+                    n = int(m.group(1))
+                    suf = m.group(2)
+                    if not suf:
+                        return n
+                    if suf == 'k':
+                        return n * 1024
+                    if suf == 'm':
+                        return n * 1024 * 1024
+                    if suf == 'g':
+                        return n * 1024 * 1024 * 1024
+                    return n
+                filters['min_size'] = parse_size_token(lo)
+                filters['max_size'] = parse_size_token(hi)
+                continue
+            if p.startswith('date:'):
+                rng = p[len('date:'):]
+                lo, hi = None, None
+                if '..' in rng:
+                    a, b = rng.split('..', 1)
+                    lo = a.strip() or None
+                    hi = b.strip() or None
+                else:
+                    lo = rng
+                def parse_date_token(t):
+                    if not t:
+                        return None
+                    for fmt in ('%Y-%m-%d', '%Y/%m/%d'):
+                        try:
+                            return datetime.strptime(t, fmt)
+                        except Exception:
+                            continue
+                    return None
+                filters['date_from'] = parse_date_token(lo)
+                filters['date_to'] = parse_date_token(hi)
+                continue
+            # shorthand wildcard or extension
+            if '*' in p or '?' in p:
+                filters['pattern'] = p
+                continue
+            # extension shorthand like pdf or .pdf
+            if p.startswith('.'):
+                filters['ext'] = [p.lstrip('.').lower()]
+                continue
+            if re.match(r'^[a-zA-Z0-9]+$', p) and '.' not in p:
+                # treat as extension shorthand
+                filters['ext'] = [p.lower()]
+                continue
+            # unknown token - ignore or maybe treat as pattern
+        return filters, options
+
+    def _apply_filters(self, entries, filters):
+        """Filter list of entries (dicts). Returns filtered list.
+        Supported filters: ext, pattern, path, min_size, max_size, date_from, date_to
+        """
+        out = []
+        for e in entries:
+            path = e['path']
+            size = e.get('size', 0) or 0
+            mtime = e.get('mtime')
+            basename = os.path.basename(path)
+            # path filter
+            if 'path' in filters:
+                p = filters['path'].lstrip('\\')
+                norm_remote = path.lstrip('\\')
+                if not norm_remote.lower().startswith(p.lower()):
+                    continue
+                out.append(e)
+                continue
+            # extension filter
+            if 'ext' in filters:
+                exts = filters['ext']
+                if any(basename.lower().endswith('.' + ex) for ex in exts):
+                    out.append(e)
+                continue
+            # pattern filter
+            if 'pattern' in filters:
+                pat = filters['pattern']
+                if fnmatch.fnmatch(basename, pat):
+                    out.append(e)
+                continue
+            # size filters
+            if filters.get('min_size') is not None and size < filters.get('min_size'):
+                continue
+            if filters.get('max_size') is not None and size > filters.get('max_size'):
+                continue
+            # date filters
+            if filters.get('date_from') is not None:
+                if mtime is None or mtime < filters.get('date_from'):
+                    continue
+            if filters.get('date_to') is not None:
+                if mtime is None or mtime > filters.get('date_to'):
+                    continue
+            # if no special filters matched above, and none applied, accept
+            if not any(k in filters for k in ('ext', 'pattern', 'path')):
+                out.append(e)
+        return out
+
     def do_mget(self, line):
         """Recursively download contents from current directory:
         mget *        (Downloads everything recursively in current directory)
@@ -358,67 +584,6 @@ class InteractiveSMBShell(cmd.Cmd):
         downloader = ResilientDownloader(self.smb_mgr, self.current_share, self.threads)
         downloader.start_sync(self.current_path, self.local_dir, pattern=pattern)
 
-    def _parse_lsf_args(self, argline):
-        """Parse lsf argument line and return filters dict:
-        Supported filters:
-          - ext:<ext1,ext2> or .pdf or pdf  -> extension(s)
-          - path:<remote_path>             -> remote path to restrict to (relative to share)
-          - pattern:<wildcard> or wildcard with * or ? -> fnmatch pattern on filename
-        If no filter specified, returns empty dict meaning 'all files'.
-        """
-        args = argline.strip()
-        filters = {}
-        if not args:
-            return filters
-
-        # path filter
-        if args.startswith('path:'):
-            filters['path'] = args[len('path:'):].strip().replace('/', '\\')
-            return filters
-
-        # pattern filter
-        if args.startswith('pattern:'):
-            filters['pattern'] = args[len('pattern:'):].strip()
-            return filters
-
-        # ext filter like ext:pdf or .pdf or pdf
-        if args.startswith('ext:'):
-            exts = [e.strip().lstrip('.') .lower() for e in args[len('ext:'):].split(',') if e.strip()]
-            filters['ext'] = exts
-            return filters
-
-        # wildcard direct
-        if '*' in args or '?' in args:
-            filters['pattern'] = args
-            return filters
-
-        # single extension or filename
-        if args.startswith('.') or '.' in args and '/' not in args and '\\' not in args:
-            # treat as extension or filename
-            if args.startswith('.'):
-                filters['ext'] = [args.lstrip('.').lower()]
-            elif args.count('.') == 1 and '*' not in args:
-                # treat like filename or extension
-                if args.startswith('*.'):
-                    filters['pattern'] = args
-                else:
-                    # if begins with * treat pattern else if just 'pdf' assume extension
-                    if args.lower().isdigit():
-                        filters['pattern'] = args
-                    else:
-                        if args.lower().startswith('*.'):
-                            filters['pattern'] = args
-                        else:
-                            filters['ext'] = [args.lower()]
-            else:
-                filters['pattern'] = args
-            return filters
-
-        # fallback: treat as extension name without dot
-        if args:
-            filters['ext'] = [args.lower()]
-        return filters
-
     def do_lsf(self, line):
         """List files from current share recursively and optionally filter them.
 
@@ -429,64 +594,87 @@ class InteractiveSMBShell(cmd.Cmd):
           lsf .mp3            -> show mp3 files
           lsf pattern:Xy*     -> wildcard pattern on filename
           lsf path:Folder\\Sub -> show files only under that remote path (recursive)
-        The results are cached in memory and you can use 'transfer' to download the filtered set.
+          lsf size:1k-10m     -> min and max size (supports k/m/g suffix)
+          lsf date:2023-01-01..2023-12-31 -> date range (YYYY-MM-DD)
+          lsf --export=out.csv    -> export results (CSV by default)
+          lsf --json              -> export JSON
         """
         if not self.current_share:
             print("[-] Error: Select a share first using 'use <SHARE_NAME>'")
             return
 
-        filters = self._parse_lsf_args(line)
+        filters, options = self._parse_lsf_args(line)
         downloader = ResilientDownloader(self.smb_mgr, self.current_share, self.threads)
 
         print("[+] Scanning remote files (this may take a while)...")
         all_files = downloader.scan_files(self.smb, self.current_path)
         self.last_scan = all_files
 
-        filtered = []
-        for remote_path, size in all_files:
-            basename = os.path.basename(remote_path)
-            # path filter
-            if 'path' in filters:
-                p = filters['path'].lstrip('\\')
-                # normalize for comparison
-                norm_remote = remote_path.lstrip('\\')
-                if not norm_remote.lower().startswith(p.lower()):
-                    continue
-                filtered.append((remote_path, size))
-                continue
-
-            # extension filter
-            if 'ext' in filters:
-                exts = filters['ext']
-                if any(basename.lower().endswith('.' + e) for e in exts):
-                    filtered.append((remote_path, size))
-                continue
-
-            # pattern filter
-            if 'pattern' in filters:
-                pat = filters['pattern']
-                if fnmatch.fnmatch(basename, pat):
-                    filtered.append((remote_path, size))
-                continue
-
-            # no filter -> accept all
-            filtered.append((remote_path, size))
-
+        filtered = self._apply_filters(all_files, filters)
         self.last_filtered = filtered
 
-        # display results as tree-like with sizes
+        # display results as numbered tree-like with sizes and mtime
         print(f"\nFound {len(filtered)} files:")
-        print("-" * 80)
-        for remote_path, size in filtered:
-            print(f"{remote_path}  -  {size} bytes")
-        print("-" * 80 + "\n")
+        print("-" * 120)
+        for idx, e in enumerate(filtered, start=1):
+            mtime_str = e['mtime'].strftime('%Y-%m-%d %H:%M:%S') if e.get('mtime') else 'N/A'
+            print(f"{idx:4d}. {e['path']}  -  {e['size']} bytes  -  {mtime_str}")
+        print("-" * 120 + "\n")
+
+        # export if requested
+        if options.get('export'):
+            outpath = options['export']
+            fmt = options.get('format', 'csv')
+            try:
+                if fmt == 'json':
+                    with open(outpath, 'w', encoding='utf-8') as jf:
+                        json.dump(filtered, jf, default=str, indent=2)
+                else:
+                    with open(outpath, 'w', newline='', encoding='utf-8') as cf:
+                        writer = csv.writer(cf)
+                        writer.writerow(['path', 'size', 'mtime'])
+                        for e in filtered:
+                            writer.writerow([e['path'], e['size'], e['mtime'].isoformat() if e.get('mtime') else ''])
+                print(f"[+] Exported {len(filtered)} results to {outpath}")
+            except Exception as ex:
+                print(f"[-] Failed to export results: {ex}")
+
+    def do_select(self, line):
+        """Select items from the last lsf output to be the current filtered set.
+        Usage: select 1,3-5  (selects by indexes shown by lsf; 1-based)
+        select clear        (clears selection)
+        """
+        if not self.last_filtered:
+            print("[-] No lsf results to select from. Run 'lsf' first.")
+            return
+        arg = line.strip()
+        if not arg:
+            print("Usage: select <index-set>  (e.g. select 1-5,8)")
+            return
+        if arg.lower() == 'clear':
+            self.last_filtered = []
+            print("[+] Selection cleared.")
+            return
+        idxs = parse_index_set(arg)
+        picked = []
+        for i in idxs:
+            if 0 <= i < len(self.last_filtered):
+                picked.append(self.last_filtered[i])
+        if not picked:
+            print("[-] No matching indexes found in last lsf output.")
+            return
+        self.last_filtered = picked
+        print(f"[+] Selected {len(picked)} items for transfer.")
 
     def do_transfer(self, line):
         """Transfer the currently filtered files into the local download directory.
 
         Usage:
-          transfer           -> downloads files from last 'lsf' filter into local dir
-          transfer <nthreads> -> override number of threads for this transfer
+          transfer                       -> downloads files from last 'lsf' filter into local dir
+          transfer --dry-run             -> show what would be downloaded without starting
+          transfer --threads N           -> set number of threads for this transfer
+          transfer 1-5,8                 -> transfer only the indexed items from last lsf output
+          transfer --dry-run 1-5         -> combine options
         """
         if not self.current_share:
             print("[-] Error: Select a share first using 'use <SHARE_NAME>'")
@@ -496,14 +684,65 @@ class InteractiveSMBShell(cmd.Cmd):
             print("[-] No filtered files found. Run 'lsf' (with optional filter) first.")
             return
 
-        try:
-            nthreads = int(line.strip()) if line.strip() else self.threads
-        except ValueError:
-            print("[-] Invalid thread count. Using default.")
-            nthreads = self.threads
+        parts = shlex.split(line)
+        dry_run = False
+        nthreads = self.threads
+        index_expr = None
+        i = 0
+        while i < len(parts):
+            p = parts[i]
+            if p in ('--dry-run', '--dry'):
+                dry_run = True
+                i += 1
+                continue
+            if p.startswith('--threads='):
+                try:
+                    nthreads = int(p.split('=', 1)[1])
+                except Exception:
+                    pass
+                i += 1
+                continue
+            if p == '--threads' and i + 1 < len(parts):
+                try:
+                    nthreads = int(parts[i + 1])
+                except Exception:
+                    pass
+                i += 2
+                continue
+            # leftover token treat as index expression or thread count numeric
+            if re.match(r'^\d+$', p) and len(parts) == 1:
+                try:
+                    nthreads = int(p)
+                except Exception:
+                    pass
+                i += 1
+                continue
+            # otherwise treat as indices
+            index_expr = p
+            i += 1
+
+        to_transfer = self.last_filtered
+        if index_expr:
+            idxs = parse_index_set(index_expr)
+            selected = []
+            for j in idxs:
+                if 0 <= j < len(self.last_filtered):
+                    selected.append(self.last_filtered[j])
+            to_transfer = selected
+
+        if not to_transfer:
+            print("[-] No files selected for transfer.")
+            return
+
+        print(f"[+] Preparing to transfer {len(to_transfer)} files to {self.local_dir}")
+        if dry_run:
+            print("[DRY-RUN] The following files would be downloaded:")
+            for e in to_transfer:
+                print(f"  {e['path']}  -  {e['size']} bytes")
+            return
 
         downloader = ResilientDownloader(self.smb_mgr, self.current_share, nthreads)
-        downloader.start_sync_from_list(self.last_filtered, self.local_dir)
+        downloader.start_sync_from_list(to_transfer, self.local_dir)
 
     def do_exit(self, line):
         """Exit the shell."""
@@ -514,6 +753,7 @@ class InteractiveSMBShell(cmd.Cmd):
         return True
 
 
+# Minimal CLI entrypoint
 def main():
     parser = argparse.ArgumentParser(description="Resilient Interactive SMB Client")
     parser.add_argument('target', help='[[domain/]username[:password]@]<targetName or address>')
@@ -543,6 +783,7 @@ def main():
         shell.cmdloop()
     except Exception as e:
         logging.error(f"Connection error: {e}")
+
 
 if __name__ == '__main__':
     main()
