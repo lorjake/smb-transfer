@@ -1,4 +1,3 @@
-```markdown name=README.md
 # smb-transfer
 
 smb-transfer is an interactive, resilient SMB client built on top of Impacket. It provides a REPL for exploring SMB shares, performing recursive file discovery with powerful filters (by extension, path, and filename wildcards), and reliably transferring filtered file sets with multi-threaded, resumable downloads.
